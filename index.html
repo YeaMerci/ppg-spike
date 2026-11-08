@@ -36,7 +36,8 @@
     <div id="preview"><video id="video" playsinline muted autoplay></video></div>
     <div>
       <div class="big"><span id="hr">–</span> <span class="dim">уд/мин</span></div>
-      <div class="dim">fps: <b id="fps">–</b> · R: <b id="rmean">–</b> · палец: <b id="finger">–</b></div>
+      <div class="dim">fps: <b id="fps">–</b> · R: <b id="rmean">–</b> · G: <b id="gmean">–</b> · палец: <b id="finger">–</b></div>
+      <div class="dim">пересвет: <b id="sat">–</b> · канал: <b id="chan">–</b></div>
       <div class="dim">качество пульса: <b id="snr">–</b></div>
     </div>
   </div>
@@ -83,13 +84,14 @@ const cropCtx = crop.getContext("2d", { willReadFrequently: true });
 
 // Everything the report shows; filled as checks run.
 const R = {
-  page_version: "spike-1",
+  page_version: "spike-2",
   started_at: new Date().toISOString(),
-  env: {}, camera: {}, torch: {}, frames: {}, pulse: {}, wake_lock: null, events: [],
+  env: {}, camera: {}, torch: {}, frames: {}, pulse: {}, exposure: { actions: [] }, wake_lock: null, events: [],
 };
 let stream = null, track = null, torchOn = false, running = false;
 let samples = []; // {t (ms), r, g, b}
 let fpsHistory = [];
+let fpsFinger = []; // fps while the finger covers the lens with the torch on: the case that matters
 
 function log(type, detail) {
   R.events.push({ t: Math.round(performance.now()), type, detail: detail === undefined ? "" : String(detail) });
@@ -141,11 +143,19 @@ async function startCamera(deviceId) {
   R.camera.settings = track.getSettings ? track.getSettings() : null;
   R.camera.capabilities = track.getCapabilities ? safeCaps(track.getCapabilities()) : "getCapabilities unavailable";
   R.torch.capability = !!(R.camera.capabilities && R.camera.capabilities.torch);
+  const cc = R.camera.capabilities || {};
+  R.exposure.controls = [
+    cc.exposureCompensation ? "compensation" : null,
+    cc.exposureTime && cc.exposureMode && cc.exposureMode.includes("manual") ? "manual time" : null,
+    cc.iso ? "iso" : null,
+  ].filter(Boolean);
+  R.exposure.actions = []; delete R.exposure.exhausted; delete R.exposure.sat_first; delete R.exposure.sat_now;
+  hrHistory = [];
   torchOn = false;
   log("camera_on", track.label);
   await listCameras();
   running = true;
-  samples = []; fpsHistory = [];
+  samples = []; fpsHistory = []; fpsFinger = [];
   scheduleFrame();
   requestWakeLock();
   $("btnTorch").disabled = false;
@@ -227,14 +237,14 @@ function onFrame(now, meta) {
     const s = Math.min(w, h) * 0.5;
     cropCtx.drawImage(video, (w - s) / 2, (h - s) / 2, s, s, 0, 0, 32, 32);
     const d = cropCtx.getImageData(0, 0, 32, 32).data;
-    let r = 0, g = 0, b = 0;
-    for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
+    let r = 0, g = 0, b = 0, sat = 0;
+    for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; if (d[i] >= 250) sat++; }
     const n = d.length / 4;
     // prefer the camera's own timestamp; mediaTime is in seconds
     let t = now;
     if (meta) t = meta.captureTime || (meta.mediaTime !== undefined ? meta.mediaTime * 1000 : now);
     if (!R.frames.ts_source) R.frames.ts_source = meta ? (meta.captureTime ? "captureTime" : "mediaTime") : "rAF";
-    samples.push({ t, r: r / n, g: g / n, b: b / n });
+    samples.push({ t, r: r / n, g: g / n, b: b / n, sat: sat / n });
     const cutoff = t - 15000;
     while (samples.length && samples[0].t < cutoff) samples.shift();
     if (!R.frames.size) R.frames.size = [w, h];
@@ -256,6 +266,9 @@ function analyse() {
   if (fpsHistory.length > 240) fpsHistory.shift();
   $("fps").textContent = fps.toFixed(1);
   $("rmean").textContent = last.r.toFixed(0);
+  $("gmean").textContent = last.g.toFixed(0);
+  $("sat").textContent = `${Math.round(last.sat * 100)}%`;
+  $("sat").className = last.sat > 0.3 ? "bad" : last.sat > 0.1 ? "warn" : "ok";
   const finger = fingerPresent(last);
   $("finger").textContent = finger ? "да" : "нет";
   $("finger").className = finger ? "ok" : "bad";
@@ -263,18 +276,24 @@ function analyse() {
   const sorted = fpsHistory.slice().sort((a, b) => a - b);
   R.frames.fps_median = +sorted[Math.floor(sorted.length / 2)].toFixed(1);
   R.frames.fps_min = +sorted[0].toFixed(1);
+  if (finger && torchOn) {
+    fpsFinger.push(fps);
+    if (fpsFinger.length > 240) fpsFinger.shift();
+    const sf = fpsFinger.slice().sort((a, b) => a - b);
+    R.frames.fps_finger_torch = +sf[Math.floor(sf.length / 2)].toFixed(1);
+  }
 
   drawWave();
 }
 
-// Detrended red, inverted so that a heartbeat (more blood, less red light) points up.
-function detrended(win) {
+// Detrended channel ("r" or "g"), inverted so that a heartbeat (more blood, less light) points up.
+function detrended(win, key = "r") {
   const out = [];
   let j0 = 0, sum = 0;
   for (let i = 0; i < win.length; i++) {
-    sum += win[i].r;
-    while (win[i].t - win[j0].t > 1000) { sum -= win[j0].r; j0++; }
-    out.push({ t: win[i].t, v: -(win[i].r - sum / (i - j0 + 1)) });
+    sum += win[i][key];
+    while (win[i].t - win[j0].t > 1000) { sum -= win[j0][key]; j0++; }
+    out.push({ t: win[i].t, v: -(win[i][key] - sum / (i - j0 + 1)) });
   }
   return out;
 }
@@ -283,7 +302,7 @@ function drawWave() {
   const c = $("wave"), ctx = c.getContext("2d");
   ctx.clearRect(0, 0, c.width, c.height);
   const last = samples[samples.length - 1].t;
-  const win = detrended(samples.filter((s) => s.t > last - 7000)).filter((p) => p.t > last - 6000);
+  const win = detrended(samples.filter((s) => s.t > last - 7000), R.pulse.channel || "r").filter((p) => p.t > last - 6000);
   if (win.length < 3) return;
   let lo = Infinity, hi = -Infinity;
   for (const p of win) { lo = Math.min(lo, p.v); hi = Math.max(hi, p.v); }
@@ -298,33 +317,102 @@ function drawWave() {
 }
 
 // Dominant frequency of the last 10 s, 40 to 200 bpm, by a direct Fourier sum on the real timestamps.
-function estimateHr() {
-  if (!running || samples.length < 10) return;
-  const last = samples[samples.length - 1].t;
-  if (last - samples[0].t < 8000) { $("hr").textContent = "…"; return; }
-  const win = detrended(samples.filter((s) => s.t > last - 10500)).filter((p) => p.t > last - 10000);
-  if (win.length < 50) return;
-  const fingerShare = samples.filter((s) => s.t > last - 10000 && fingerPresent(s)).length / win.length;
+// Dominant frequency of one channel over the last 10 s, 40 to 200 bpm, by a direct Fourier sum on the real timestamps.
+function spectrumPeak(raw, key) {
+  const win = detrended(raw, key).filter((p) => p.t > raw[raw.length - 1].t - 10000);
   let mean = 0; for (const p of win) mean += p.v; mean /= win.length;
-  const powers = [];
+  let best = { bpm: 0, p: -1 }, total = 0, count = 0;
   for (let bpm = 40; bpm <= 200; bpm += 1) {
     const w = (2 * Math.PI * bpm) / 60000;
     let re = 0, im = 0;
     for (const p of win) { const x = p.v - mean; re += x * Math.cos(w * p.t); im -= x * Math.sin(w * p.t); }
-    powers.push({ bpm, p: re * re + im * im });
+    const pw = re * re + im * im;
+    total += pw; count++;
+    if (pw > best.p) best = { bpm, p: pw };
   }
-  const best = powers.reduce((a, b) => (b.p > a.p ? b : a));
-  const avg = powers.reduce((a, b) => a + b.p, 0) / powers.length;
-  const snr = best.p / avg;
-  $("hr").textContent = fingerShare > 0.8 ? best.bpm : "–";
-  const q = snr > 8 ? ["хорошее", "ok"] : snr > 4 ? ["слабое", "warn"] : ["нет", "bad"];
-  $("snr").textContent = `${q[0]} (${snr.toFixed(1)})`;
+  return { bpm: best.bpm, snr: best.p / (total / count), channel: key };
+}
+
+let hrHistory = []; // last estimates, to require a stable peak (a motion spike gives one-off "good" peaks)
+
+function estimateHr() {
+  if (!running || samples.length < 10) return;
+  const last = samples[samples.length - 1].t;
+  if (last - samples[0].t < 8000) { $("hr").textContent = "…"; return; }
+  const raw = samples.filter((s) => s.t > last - 10500);
+  const recent = raw.filter((s) => s.t > last - 10000);
+  if (recent.length < 50) return;
+  const fingerShare = recent.filter(fingerPresent).length / recent.length;
+  const satMean = recent.reduce((a, s) => a + s.sat, 0) / recent.length;
+  if (fingerShare < 0.8) {
+    hrHistory = [];
+    $("hr").textContent = "–"; $("snr").textContent = "нет пальца"; $("snr").className = "dim"; $("chan").textContent = "–";
+    return;
+  }
+  // Red is the usual PPG channel but clips under the torch; green rarely clips. Use whichever has the cleaner peak,
+  // and do not trust red when more than 30% of its pixels are clipped.
+  const cands = [spectrumPeak(raw, "g")];
+  if (satMean < 0.3) cands.push(spectrumPeak(raw, "r"));
+  const valid = cands.filter((c) => isFinite(c.snr));
+  if (!valid.length) return;
+  const best = valid.reduce((a, b) => (b.snr > a.snr ? b : a));
+  // A peak on the edge of the 40..200 band is a step or a motion transient, not a heartbeat.
+  if (best.bpm <= 42 || best.bpm >= 198) best.snr = 0;
+  hrHistory.push(best.bpm);
+  if (hrHistory.length > 4) hrHistory.shift();
+  const stable = hrHistory.length >= 3 && Math.max(...hrHistory) - Math.min(...hrHistory) <= 6;
+  R.pulse.channel = best.channel;
+  $("chan").textContent = best.channel === "r" ? "красный" : "зелёный";
+  $("hr").textContent = stable ? best.bpm : "…";
+  const q = stable && best.snr > 8 ? ["хорошее", "ok"] : stable && best.snr > 4 ? ["слабое", "warn"] : ["нестабильно", "bad"];
+  $("snr").textContent = `${q[0]} (${best.snr.toFixed(1)})`;
   $("snr").className = q[1];
-  if (fingerShare > 0.8) {
-    R.pulse.last_bpm = best.bpm;
-    R.pulse.last_snr = +snr.toFixed(1);
-    if (!R.pulse.best_snr || snr > R.pulse.best_snr) { R.pulse.best_snr = +snr.toFixed(1); R.pulse.bpm_at_best = best.bpm; }
+  R.pulse.last = { bpm: best.bpm, snr: +best.snr.toFixed(1), channel: best.channel, stable, red_clipped: +satMean.toFixed(2) };
+  if (stable && (!R.pulse.best_snr || best.snr > R.pulse.best_snr)) {
+    R.pulse.best_snr = +best.snr.toFixed(1); R.pulse.bpm_at_best = best.bpm; R.pulse.channel_at_best = best.channel;
   }
+}
+
+// ---------- exposure: pull red out of clipping ----------
+// Under the torch the camera's auto-exposure meters on the dark green/blue and clips red at 255.
+// Once per second, while the torch is on and a finger is present, step exposure down by whatever control
+// the camera offers (exposure compensation first, then manual exposure time) until under 10% of pixels clip.
+let exposureBusy = false;
+async function tuneExposure() {
+  if (!running || !track || !torchOn || exposureBusy || samples.length < 10) return;
+  const recent = samples.slice(-15);
+  if (!recent.every(fingerPresent)) return;
+  const sat = recent.reduce((a, s) => a + s.sat, 0) / recent.length;
+  const E = R.exposure;
+  if (E.sat_first === undefined) E.sat_first = +sat.toFixed(2);
+  E.sat_now = +sat.toFixed(2);
+  if (sat < 0.1 || E.exhausted) return;
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  const st = track.getSettings ? track.getSettings() : {};
+  let c = null, label = "";
+  if (caps.exposureCompensation && st.exposureCompensation !== undefined && st.exposureCompensation > caps.exposureCompensation.min) {
+    const span = caps.exposureCompensation.max - caps.exposureCompensation.min;
+    const v = Math.max(caps.exposureCompensation.min, st.exposureCompensation - Math.max(caps.exposureCompensation.step || 0, span / 6));
+    c = { exposureCompensation: v }; label = `exposureCompensation ${st.exposureCompensation} → ${v}`;
+  } else if (caps.exposureTime && caps.exposureMode && caps.exposureMode.includes("manual")) {
+    const cur = st.exposureTime || caps.exposureTime.max / 4;
+    const v = Math.max(caps.exposureTime.min, cur * 0.6);
+    if (v >= cur) { E.exhausted = "exposureTime at minimum"; return; }
+    c = { exposureMode: "manual", exposureTime: v }; label = `exposureTime ${Math.round(cur)} → ${Math.round(v)}`;
+  } else {
+    E.exhausted = "no exposure control available";
+    return;
+  }
+  exposureBusy = true;
+  try {
+    await track.applyConstraints({ advanced: [c] });
+    E.actions.push({ t: Math.round(performance.now()), set: label, sat_before: +sat.toFixed(2), result: "ok" });
+  } catch (e) {
+    E.actions.push({ t: Math.round(performance.now()), set: label, result: `${e.name}: ${e.message}` });
+    E.exhausted = "applyConstraints rejected";
+  }
+  exposureBusy = false;
+  if (E.actions.length >= 10) E.exhausted = "10 steps done";
 }
 
 // ---------- wake lock and lifecycle ----------
@@ -342,7 +430,7 @@ function mark(ok, text) {
 }
 
 function render() {
-  const e = R.env, c = R.camera, t = R.torch, f = R.frames, p = R.pulse;
+  const e = R.env, c = R.camera, t = R.torch, f = R.frames, p = R.pulse, x = R.exposure;
   const rows = [
     ["Telegram Mini App", e.tg ? mark(true, `${e.tg_platform} ${e.tg_version}`) : mark(false, "открыто не в Telegram")],
     ["HTTPS / камера в API", mark(e.secure_context && e.has_getUserMedia, e.secure_context ? "" : "нет secure context")],
@@ -352,8 +440,11 @@ function render() {
     ["Фонарик: команда", t.apply ? mark(t.apply === "resolved", t.apply) : mark(null)],
     ["Фонарик горит (глазами)", t.visual === undefined ? mark(null) : mark(t.visual, t.visual ? "да" : "нет")],
     ["Кадров в секунду", f.fps_median ? mark(f.fps_median >= 25 ? true : f.fps_median >= 15 ? "warn" : false, `${f.fps_median} (мин ${f.fps_min})`) : mark(null)],
+    ["fps с пальцем и фонариком", f.fps_finger_torch ? mark(f.fps_finger_torch >= 25 ? true : f.fps_finger_torch >= 15 ? "warn" : false, String(f.fps_finger_torch)) : mark(null)],
     ["Метки времени", f.ts_source ? mark(f.ts_source !== "rAF" ? true : "warn", f.ts_source) : mark(null)],
-    ["Пульс виден", p.best_snr ? mark(p.best_snr > 8 ? true : p.best_snr > 4 ? "warn" : false, `${p.bpm_at_best} уд/мин, SNR ${p.best_snr}`) : mark(null)],
+    ["Управление экспозицией", c.access === "ok" ? mark(x.controls && x.controls.length ? true : "warn", x.controls && x.controls.length ? x.controls.join(", ") : "нет") : mark(null)],
+    ["Пересвет красного", x.sat_first !== undefined ? mark(x.sat_now < 0.1 ? true : x.sat_now < 0.3 ? "warn" : false, `${Math.round(x.sat_first * 100)}% → ${Math.round(x.sat_now * 100)}% (шагов: ${x.actions.length}${x.exhausted ? ", " + x.exhausted : ""})`) : mark(null, "нужны палец и фонарик")],
+    ["Пульс виден (стабильно)", p.best_snr ? mark(p.best_snr > 8 ? true : p.best_snr > 4 ? "warn" : false, `${p.bpm_at_best} уд/мин, SNR ${p.best_snr}, ${p.channel_at_best === "r" ? "красный" : "зелёный"}`) : mark(null)],
     ["Экран не гаснет", R.wake_lock ? mark(R.wake_lock === "ok" ? true : "warn", R.wake_lock) : mark(null)],
     ["Свайп не закрывает", e.tg ? mark(e.tg_disable_swipes === true ? true : "warn", String(e.tg_disable_swipes)) : mark(null)],
   ];
@@ -381,7 +472,7 @@ $("btnCopy").onclick = async () => {
 initEnv();
 render();
 setInterval(analyse, 250);
-setInterval(() => { estimateHr(); render(); }, 1000);
+setInterval(() => { estimateHr(); tuneExposure(); render(); }, 1000);
 </script>
 </body>
 </html>
