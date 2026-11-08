@@ -41,6 +41,7 @@
       <div class="dim">качество пульса: <b id="snr">–</b></div>
     </div>
   </div>
+  <div class="dim" id="summary" style="margin:6px 0"></div>
   <canvas id="wave" width="600" height="120"></canvas>
   <div class="dim" style="margin-top:6px">Приложите палец к задней камере и вспышке. Пульс считается по последним 10 с.</div>
 </div>
@@ -79,16 +80,16 @@ const tg = window.Telegram && window.Telegram.WebApp;
 const $ = (id) => document.getElementById(id);
 const video = $("video");
 const crop = document.createElement("canvas");
-crop.width = crop.height = 32;
+crop.width = crop.height = 48;
 const cropCtx = crop.getContext("2d", { willReadFrequently: true });
 
 // Everything the report shows; filled as checks run.
 const R = {
-  page_version: "spike-2",
+  page_version: "spike-3",
   started_at: new Date().toISOString(),
   env: {}, camera: {}, torch: {}, frames: {}, pulse: {}, exposure: { actions: [] }, wake_lock: null, events: [],
 };
-let stream = null, track = null, torchOn = false, running = false;
+let stream = null, track = null, torchOn = false, running = false, autoLensDone = false;
 let samples = []; // {t (ms), r, g, b}
 let fpsHistory = [];
 let fpsFinger = []; // fps while the finger covers the lens with the torch on: the case that matters
@@ -180,6 +181,15 @@ async function listCameras() {
     const sel = $("selCam");
     sel.innerHTML = "";
     const current = track && track.getSettings ? track.getSettings().deviceId : null;
+    if (!autoLensDone && track && /тройн|двойн|triple|dual/i.test(track.label)) {
+      const plain = devs.find((d) => /^(задняя камера|back camera)$/i.test(d.label.trim()));
+      if (plain) {
+        autoLensDone = true;
+        R.camera.auto_switched_from = track.label;
+        log("auto_lens", `${track.label} -> ${plain.label}`);
+        setTimeout(() => startCamera(plain.deviceId).then(render), 0);
+      }
+    }
     devs.forEach((d, i) => {
       const o = document.createElement("option");
       o.value = d.deviceId;
@@ -232,19 +242,24 @@ function scheduleFrame() {
 function onFrame(now, meta) {
   if (!running) return;
   if (video.videoWidth > 0) {
-    // central 50% crop, averaged down to 32x32
+    // whole frame averaged down to 48x48; the centre is the middle 24x24 (the central 50%)
     const w = video.videoWidth, h = video.videoHeight;
-    const s = Math.min(w, h) * 0.5;
-    cropCtx.drawImage(video, (w - s) / 2, (h - s) / 2, s, s, 0, 0, 32, 32);
-    const d = cropCtx.getImageData(0, 0, 32, 32).data;
-    let r = 0, g = 0, b = 0, sat = 0;
-    for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; if (d[i] >= 250) sat++; }
-    const n = d.length / 4;
+    cropCtx.drawImage(video, 0, 0, w, h, 0, 0, 48, 48);
+    const d = cropCtx.getImageData(0, 0, 48, 48).data;
+    let r = 0, g = 0, b = 0, sat = 0, rf = 0, satf = 0;
+    for (let y = 0; y < 48; y++) {
+      for (let x = 0; x < 48; x++) {
+        const i = (y * 48 + x) * 4;
+        rf += d[i]; if (d[i] >= 250) satf++;
+        if (x >= 12 && x < 36 && y >= 12 && y < 36) { r += d[i]; g += d[i + 1]; b += d[i + 2]; if (d[i] >= 250) sat++; }
+      }
+    }
+    const n = 24 * 24, nf = 48 * 48;
     // prefer the camera's own timestamp; mediaTime is in seconds
     let t = now;
     if (meta) t = meta.captureTime || (meta.mediaTime !== undefined ? meta.mediaTime * 1000 : now);
     if (!R.frames.ts_source) R.frames.ts_source = meta ? (meta.captureTime ? "captureTime" : "mediaTime") : "rAF";
-    samples.push({ t, r: r / n, g: g / n, b: b / n, sat: sat / n });
+    samples.push({ t, r: r / n, g: g / n, b: b / n, sat: sat / n, rf: rf / nf, satf: satf / nf });
     const cutoff = t - 15000;
     while (samples.length && samples[0].t < cutoff) samples.shift();
     if (!R.frames.size) R.frames.size = [w, h];
@@ -333,6 +348,7 @@ function spectrumPeak(raw, key) {
   return { bpm: best.bpm, snr: best.p / (total / count), channel: key };
 }
 
+const CHANNEL_NAMES = { r: "красный (центр)", rf: "красный (весь кадр)", sat: "доля пересвета", g: "зелёный" };
 let hrHistory = []; // last estimates, to require a stable peak (a motion spike gives one-off "good" peaks)
 
 function estimateHr() {
@@ -349,10 +365,16 @@ function estimateHr() {
     $("hr").textContent = "–"; $("snr").textContent = "нет пальца"; $("snr").className = "dim"; $("chan").textContent = "–";
     return;
   }
-  // Red is the usual PPG channel but clips under the torch; green rarely clips. Use whichever has the cleaner peak,
-  // and do not trust red when more than 30% of its pixels are clipped.
-  const cands = [spectrumPeak(raw, "g")];
+  // Red is the usual PPG channel but clips under the torch when exposure cannot be lowered (iPhone).
+  // Candidates: centre red (if under 30% clipped), whole-frame red (edges clip less), the clipped share itself
+  // (more blood, less light, fewer clipped pixels), green (only if bright enough to carry a signal).
+  const mean = (k) => recent.reduce((a, s) => a + s[k], 0) / recent.length;
+  const cands = [];
   if (satMean < 0.3) cands.push(spectrumPeak(raw, "r"));
+  if (mean("satf") < 0.6) cands.push(spectrumPeak(raw, "rf"));
+  if (satMean > 0.05 && satMean < 0.95) cands.push(spectrumPeak(raw, "sat"));
+  if (mean("g") >= 8) cands.push(spectrumPeak(raw, "g"));
+  if (!cands.length) { $("snr").textContent = "нет пригодного сигнала"; $("snr").className = "bad"; return; }
   const valid = cands.filter((c) => isFinite(c.snr));
   if (!valid.length) return;
   const best = valid.reduce((a, b) => (b.snr > a.snr ? b : a));
@@ -362,7 +384,7 @@ function estimateHr() {
   if (hrHistory.length > 4) hrHistory.shift();
   const stable = hrHistory.length >= 3 && Math.max(...hrHistory) - Math.min(...hrHistory) <= 6;
   R.pulse.channel = best.channel;
-  $("chan").textContent = best.channel === "r" ? "красный" : "зелёный";
+  $("chan").textContent = CHANNEL_NAMES[best.channel];
   $("hr").textContent = stable ? best.bpm : "…";
   const q = stable && best.snr > 8 ? ["хорошее", "ok"] : stable && best.snr > 4 ? ["слабое", "warn"] : ["нестабильно", "bad"];
   $("snr").textContent = `${q[0]} (${best.snr.toFixed(1)})`;
@@ -444,11 +466,20 @@ function render() {
     ["Метки времени", f.ts_source ? mark(f.ts_source !== "rAF" ? true : "warn", f.ts_source) : mark(null)],
     ["Управление экспозицией", c.access === "ok" ? mark(x.controls && x.controls.length ? true : "warn", x.controls && x.controls.length ? x.controls.join(", ") : "нет") : mark(null)],
     ["Пересвет красного", x.sat_first !== undefined ? mark(x.sat_now < 0.1 ? true : x.sat_now < 0.3 ? "warn" : false, `${Math.round(x.sat_first * 100)}% → ${Math.round(x.sat_now * 100)}% (шагов: ${x.actions.length}${x.exhausted ? ", " + x.exhausted : ""})`) : mark(null, "нужны палец и фонарик")],
-    ["Пульс виден (стабильно)", p.best_snr ? mark(p.best_snr > 8 ? true : p.best_snr > 4 ? "warn" : false, `${p.bpm_at_best} уд/мин, SNR ${p.best_snr}, ${p.channel_at_best === "r" ? "красный" : "зелёный"}`) : mark(null)],
+    ["Пульс виден (стабильно)", p.best_snr ? mark(p.best_snr > 8 ? true : p.best_snr > 4 ? "warn" : false, `${p.bpm_at_best} уд/мин, SNR ${p.best_snr}, ${CHANNEL_NAMES[p.channel_at_best]}`) : mark(null)],
     ["Экран не гаснет", R.wake_lock ? mark(R.wake_lock === "ok" ? true : "warn", R.wake_lock) : mark(null)],
     ["Свайп не закрывает", e.tg ? mark(e.tg_disable_swipes === true ? true : "warn", String(e.tg_disable_swipes)) : mark(null)],
   ];
   $("checks").innerHTML = rows.map(([k, v]) => `<li><span>${k}</span>${v}</li>`).join("");
+  $("summary").innerHTML = [
+    `версия ${R.page_version}`,
+    `камера: ${c.label || "–"}`,
+    `фонарик: ${torchOn ? "вкл" : "выкл"}`,
+    `экспозиция: ${x.controls ? (x.controls.length ? x.controls.join(", ") : "нет управления") : "–"}`,
+    `fps с пальцем: ${f.fps_finger_torch || "–"}`,
+    `пересвет: ${x.sat_first !== undefined ? Math.round(x.sat_first * 100) + "% → " + Math.round(x.sat_now * 100) + "%" : "–"}`,
+    `лучший пульс: ${p.bpm_at_best ? p.bpm_at_best + " (SNR " + p.best_snr + ", " + CHANNEL_NAMES[p.channel_at_best] + ")" : "–"}`,
+  ].join(" · ");
   $("report").textContent = JSON.stringify(R, null, 1);
 }
 
