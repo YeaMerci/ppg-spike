@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>PPG spike</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { --bg:#0b0d12; --card:#161a23; --fg:#f2f4f8; --dim:#8a90a0; --ok:#2ecc71; --bad:#ff4d4f; --warn:#f5b041; --accent:#ff3b4e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 -apple-system, system-ui, Roboto, sans-serif; padding:12px 16px 40px; }
+  h1 { font-size:18px; margin:4px 0 12px; }
+  .card { background:var(--card); border-radius:12px; padding:12px; margin-bottom:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { background:#2a3040; color:var(--fg); border:0; border-radius:10px; padding:10px 14px; font-size:15px; }
+  button.primary { background:var(--accent); }
+  button:disabled { opacity:.4; }
+  select { background:#2a3040; color:var(--fg); border:0; border-radius:8px; padding:8px; max-width:100%; }
+  #preview { width:120px; height:120px; border-radius:50%; overflow:hidden; background:#13161f; flex:none; border:2px solid #fff3; }
+  #preview video { width:100%; height:100%; object-fit:cover; }
+  .big { font-size:28px; font-weight:700; }
+  .dim { color:var(--dim); font-size:13px; }
+  canvas#wave { width:100%; height:120px; background:#0f1219; border-radius:8px; display:block; }
+  ul.checks { list-style:none; padding:0; margin:0; }
+  ul.checks li { padding:4px 0; border-bottom:1px solid #ffffff10; display:flex; justify-content:space-between; gap:8px; }
+  ul.checks li span:last-child { text-align:right; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+  pre { white-space:pre-wrap; word-break:break-all; font-size:11px; color:var(--dim); max-height:220px; overflow:auto; }
+</style>
+</head>
+<body>
+<h1>Проверка камеры и фонарика (PPG)</h1>
+
+<div class="card">
+  <div class="row">
+    <div id="preview"><video id="video" playsinline muted autoplay></video></div>
+    <div>
+      <div class="big"><span id="hr">–</span> <span class="dim">уд/мин</span></div>
+      <div class="dim">fps: <b id="fps">–</b> · R: <b id="rmean">–</b> · палец: <b id="finger">–</b></div>
+      <div class="dim">качество пульса: <b id="snr">–</b></div>
+    </div>
+  </div>
+  <canvas id="wave" width="600" height="120"></canvas>
+  <div class="dim" style="margin-top:6px">Приложите палец к задней камере и вспышке. Пульс считается по последним 10 с.</div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button class="primary" id="btnStart">1. Включить камеру</button>
+    <button id="btnTorch" disabled>2. Фонарик</button>
+    <button id="btnStop" disabled>Стоп</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <span class="dim">Камера:</span>
+    <select id="selCam" disabled><option>—</option></select>
+  </div>
+  <div class="row" style="margin-top:8px" id="torchConfirm" hidden>
+    <span>Вспышка реально горит?</span>
+    <button id="btnTorchYes">Да</button>
+    <button id="btnTorchNo">Нет</button>
+  </div>
+</div>
+
+<div class="card">
+  <b>Результат</b>
+  <ul class="checks" id="checks"></ul>
+</div>
+
+<div class="card">
+  <div class="row"><b>Отчёт</b><button id="btnCopy">Скопировать</button></div>
+  <div class="dim">Если копирование не сработает, сделайте скриншот этого экрана.</div>
+  <pre id="report"></pre>
+</div>
+
+<script>
+"use strict";
+const tg = window.Telegram && window.Telegram.WebApp;
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+const crop = document.createElement("canvas");
+crop.width = crop.height = 32;
+const cropCtx = crop.getContext("2d", { willReadFrequently: true });
+
+// Everything the report shows; filled as checks run.
+const R = {
+  page_version: "spike-1",
+  started_at: new Date().toISOString(),
+  env: {}, camera: {}, torch: {}, frames: {}, pulse: {}, wake_lock: null, events: [],
+};
+let stream = null, track = null, torchOn = false, running = false;
+let samples = []; // {t (ms), r, g, b}
+let fpsHistory = [];
+
+function log(type, detail) {
+  R.events.push({ t: Math.round(performance.now()), type, detail: detail === undefined ? "" : String(detail) });
+  render();
+}
+
+// ---------- environment ----------
+function initEnv() {
+  R.env.ua = navigator.userAgent;
+  R.env.screen = [screen.width, screen.height];
+  R.env.dpr = window.devicePixelRatio;
+  R.env.secure_context = window.isSecureContext;
+  R.env.has_getUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  R.env.has_rvfc = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+  R.env.torch_constraint_supported = !!(navigator.mediaDevices && navigator.mediaDevices.getSupportedConstraints && navigator.mediaDevices.getSupportedConstraints().torch);
+  if (tg) {
+    R.env.tg = true;
+    R.env.tg_platform = tg.platform;
+    R.env.tg_version = tg.version;
+    try { tg.ready(); tg.expand(); R.env.tg_expand = true; } catch (e) { R.env.tg_expand = String(e); }
+    try {
+      if (tg.disableVerticalSwipes) { tg.disableVerticalSwipes(); R.env.tg_disable_swipes = true; }
+      else R.env.tg_disable_swipes = "unavailable";
+    } catch (e) { R.env.tg_disable_swipes = String(e); }
+  } else {
+    R.env.tg = false;
+  }
+}
+
+// ---------- camera ----------
+async function startCamera(deviceId) {
+  stopCamera(false);
+  const video_c = deviceId
+    ? { deviceId: { exact: deviceId }, frameRate: { ideal: 30 }, width: { ideal: 640 }, height: { ideal: 480 } }
+    : { facingMode: { ideal: "environment" }, frameRate: { ideal: 30 }, width: { ideal: 640 }, height: { ideal: 480 } };
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: video_c, audio: false });
+  } catch (e) {
+    R.camera.access = "error";
+    R.camera.error = `${e.name}: ${e.message}`;
+    log("camera_error", R.camera.error);
+    return false;
+  }
+  track = stream.getVideoTracks()[0];
+  video.srcObject = stream;
+  try { await video.play(); } catch (e) { log("video_play_error", e); }
+  R.camera.access = "ok";
+  R.camera.label = track.label;
+  R.camera.settings = track.getSettings ? track.getSettings() : null;
+  R.camera.capabilities = track.getCapabilities ? safeCaps(track.getCapabilities()) : "getCapabilities unavailable";
+  R.torch.capability = !!(R.camera.capabilities && R.camera.capabilities.torch);
+  torchOn = false;
+  log("camera_on", track.label);
+  await listCameras();
+  running = true;
+  samples = []; fpsHistory = [];
+  scheduleFrame();
+  requestWakeLock();
+  $("btnTorch").disabled = false;
+  $("btnStop").disabled = false;
+  $("selCam").disabled = false;
+  return true;
+}
+
+function safeCaps(c) {
+  // getCapabilities returns plain objects on most engines; copy the fields we care about
+  const out = {};
+  for (const k of ["torch", "frameRate", "width", "height", "exposureMode", "exposureCompensation", "exposureTime", "iso", "whiteBalanceMode", "colorTemperature", "focusMode", "focusDistance", "facingMode", "deviceId"]) {
+    if (c[k] !== undefined) out[k] = c[k];
+  }
+  return out;
+}
+
+async function listCameras() {
+  try {
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+    R.camera.devices = devs.map((d) => ({ label: d.label || "(без имени)", id: d.deviceId.slice(0, 8) }));
+    const sel = $("selCam");
+    sel.innerHTML = "";
+    const current = track && track.getSettings ? track.getSettings().deviceId : null;
+    devs.forEach((d, i) => {
+      const o = document.createElement("option");
+      o.value = d.deviceId;
+      o.textContent = d.label || `камера ${i + 1}`;
+      if (d.deviceId === current) o.selected = true;
+      sel.appendChild(o);
+    });
+  } catch (e) {
+    R.camera.devices_error = String(e);
+  }
+}
+
+function stopCamera(updateUi = true) {
+  running = false;
+  if (track && torchOn) { try { track.applyConstraints({ advanced: [{ torch: false }] }); } catch (e) {} }
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null; track = null; torchOn = false;
+  if (updateUi) {
+    $("btnTorch").disabled = true;
+    $("btnStop").disabled = true;
+    log("camera_off");
+  }
+}
+
+// ---------- torch ----------
+async function toggleTorch() {
+  if (!track) return;
+  const want = !torchOn;
+  try {
+    await track.applyConstraints({ advanced: [{ torch: want }] });
+    torchOn = want;
+    R.torch.apply = "resolved";
+    R.torch.settings_reports = track.getSettings ? track.getSettings().torch : undefined;
+    log(want ? "torch_on" : "torch_off", "applyConstraints resolved");
+    if (want) $("torchConfirm").hidden = false;
+  } catch (e) {
+    R.torch.apply = `rejected: ${e.name}: ${e.message}`;
+    log("torch_error", R.torch.apply);
+  }
+  $("btnTorch").textContent = torchOn ? "2. Фонарик: выкл" : "2. Фонарик";
+}
+
+// ---------- frames ----------
+function scheduleFrame() {
+  if (!running) return;
+  if (R.env.has_rvfc) video.requestVideoFrameCallback(onFrame);
+  else requestAnimationFrame((now) => onFrame(now, null));
+}
+
+function onFrame(now, meta) {
+  if (!running) return;
+  if (video.videoWidth > 0) {
+    // central 50% crop, averaged down to 32x32
+    const w = video.videoWidth, h = video.videoHeight;
+    const s = Math.min(w, h) * 0.5;
+    cropCtx.drawImage(video, (w - s) / 2, (h - s) / 2, s, s, 0, 0, 32, 32);
+    const d = cropCtx.getImageData(0, 0, 32, 32).data;
+    let r = 0, g = 0, b = 0;
+    for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
+    const n = d.length / 4;
+    // prefer the camera's own timestamp; mediaTime is in seconds
+    let t = now;
+    if (meta) t = meta.captureTime || (meta.mediaTime !== undefined ? meta.mediaTime * 1000 : now);
+    if (!R.frames.ts_source) R.frames.ts_source = meta ? (meta.captureTime ? "captureTime" : "mediaTime") : "rAF";
+    samples.push({ t, r: r / n, g: g / n, b: b / n });
+    const cutoff = t - 15000;
+    while (samples.length && samples[0].t < cutoff) samples.shift();
+    if (!R.frames.size) R.frames.size = [w, h];
+  }
+  scheduleFrame();
+}
+
+// ---------- analysis, once per 250 ms ----------
+function fingerPresent(s) {
+  return s.r >= 80 && s.g / s.r <= 0.45 && s.b / s.r <= 0.45;
+}
+
+function analyse() {
+  if (!running || samples.length < 10) return;
+  const last = samples[samples.length - 1];
+  const oneSec = samples.filter((s) => s.t > last.t - 1000);
+  const fps = oneSec.length > 1 ? (oneSec.length - 1) / ((oneSec[oneSec.length - 1].t - oneSec[0].t) / 1000) : 0;
+  fpsHistory.push(fps);
+  if (fpsHistory.length > 240) fpsHistory.shift();
+  $("fps").textContent = fps.toFixed(1);
+  $("rmean").textContent = last.r.toFixed(0);
+  const finger = fingerPresent(last);
+  $("finger").textContent = finger ? "да" : "нет";
+  $("finger").className = finger ? "ok" : "bad";
+
+  const sorted = fpsHistory.slice().sort((a, b) => a - b);
+  R.frames.fps_median = +sorted[Math.floor(sorted.length / 2)].toFixed(1);
+  R.frames.fps_min = +sorted[0].toFixed(1);
+
+  drawWave();
+}
+
+// Detrended red, inverted so that a heartbeat (more blood, less red light) points up.
+function detrended(win) {
+  const out = [];
+  let j0 = 0, sum = 0;
+  for (let i = 0; i < win.length; i++) {
+    sum += win[i].r;
+    while (win[i].t - win[j0].t > 1000) { sum -= win[j0].r; j0++; }
+    out.push({ t: win[i].t, v: -(win[i].r - sum / (i - j0 + 1)) });
+  }
+  return out;
+}
+
+function drawWave() {
+  const c = $("wave"), ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, c.width, c.height);
+  const last = samples[samples.length - 1].t;
+  const win = detrended(samples.filter((s) => s.t > last - 7000)).filter((p) => p.t > last - 6000);
+  if (win.length < 3) return;
+  let lo = Infinity, hi = -Infinity;
+  for (const p of win) { lo = Math.min(lo, p.v); hi = Math.max(hi, p.v); }
+  const span = Math.max(hi - lo, 0.2);
+  ctx.strokeStyle = "#ff5a6a"; ctx.lineWidth = 2; ctx.beginPath();
+  win.forEach((p, i) => {
+    const x = ((p.t - (last - 6000)) / 6000) * c.width;
+    const y = c.height - 8 - ((p.v - lo) / span) * (c.height - 16);
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+}
+
+// Dominant frequency of the last 10 s, 40 to 200 bpm, by a direct Fourier sum on the real timestamps.
+function estimateHr() {
+  if (!running || samples.length < 10) return;
+  const last = samples[samples.length - 1].t;
+  if (last - samples[0].t < 8000) { $("hr").textContent = "…"; return; }
+  const win = detrended(samples.filter((s) => s.t > last - 10500)).filter((p) => p.t > last - 10000);
+  if (win.length < 50) return;
+  const fingerShare = samples.filter((s) => s.t > last - 10000 && fingerPresent(s)).length / win.length;
+  let mean = 0; for (const p of win) mean += p.v; mean /= win.length;
+  const powers = [];
+  for (let bpm = 40; bpm <= 200; bpm += 1) {
+    const w = (2 * Math.PI * bpm) / 60000;
+    let re = 0, im = 0;
+    for (const p of win) { const x = p.v - mean; re += x * Math.cos(w * p.t); im -= x * Math.sin(w * p.t); }
+    powers.push({ bpm, p: re * re + im * im });
+  }
+  const best = powers.reduce((a, b) => (b.p > a.p ? b : a));
+  const avg = powers.reduce((a, b) => a + b.p, 0) / powers.length;
+  const snr = best.p / avg;
+  $("hr").textContent = fingerShare > 0.8 ? best.bpm : "–";
+  const q = snr > 8 ? ["хорошее", "ok"] : snr > 4 ? ["слабое", "warn"] : ["нет", "bad"];
+  $("snr").textContent = `${q[0]} (${snr.toFixed(1)})`;
+  $("snr").className = q[1];
+  if (fingerShare > 0.8) {
+    R.pulse.last_bpm = best.bpm;
+    R.pulse.last_snr = +snr.toFixed(1);
+    if (!R.pulse.best_snr || snr > R.pulse.best_snr) { R.pulse.best_snr = +snr.toFixed(1); R.pulse.bpm_at_best = best.bpm; }
+  }
+}
+
+// ---------- wake lock and lifecycle ----------
+async function requestWakeLock() {
+  if (!("wakeLock" in navigator)) { R.wake_lock = "unavailable"; return; }
+  try { await navigator.wakeLock.request("screen"); R.wake_lock = "ok"; }
+  catch (e) { R.wake_lock = `error: ${e.name}`; }
+}
+document.addEventListener("visibilitychange", () => log(document.hidden ? "hidden" : "visible"));
+
+// ---------- checklist and report ----------
+function mark(ok, text) {
+  if (ok === null || ok === undefined) return `<span class="dim">${text || "—"}</span>`;
+  return `<span class="${ok === "warn" ? "warn" : ok ? "ok" : "bad"}">${ok === "warn" ? "⚠" : ok ? "✓" : "✗"} ${text || ""}</span>`;
+}
+
+function render() {
+  const e = R.env, c = R.camera, t = R.torch, f = R.frames, p = R.pulse;
+  const rows = [
+    ["Telegram Mini App", e.tg ? mark(true, `${e.tg_platform} ${e.tg_version}`) : mark(false, "открыто не в Telegram")],
+    ["HTTPS / камера в API", mark(e.secure_context && e.has_getUserMedia, e.secure_context ? "" : "нет secure context")],
+    ["Доступ к камере", c.access ? mark(c.access === "ok", c.access === "ok" ? c.label : c.error) : mark(null)],
+    ["Камер найдено", c.devices ? mark(null, String(c.devices.length)) : mark(null)],
+    ["Фонарик в capabilities", c.access === "ok" ? mark(t.capability ? true : "warn", t.capability ? "есть" : "не заявлен") : mark(null)],
+    ["Фонарик: команда", t.apply ? mark(t.apply === "resolved", t.apply) : mark(null)],
+    ["Фонарик горит (глазами)", t.visual === undefined ? mark(null) : mark(t.visual, t.visual ? "да" : "нет")],
+    ["Кадров в секунду", f.fps_median ? mark(f.fps_median >= 25 ? true : f.fps_median >= 15 ? "warn" : false, `${f.fps_median} (мин ${f.fps_min})`) : mark(null)],
+    ["Метки времени", f.ts_source ? mark(f.ts_source !== "rAF" ? true : "warn", f.ts_source) : mark(null)],
+    ["Пульс виден", p.best_snr ? mark(p.best_snr > 8 ? true : p.best_snr > 4 ? "warn" : false, `${p.bpm_at_best} уд/мин, SNR ${p.best_snr}`) : mark(null)],
+    ["Экран не гаснет", R.wake_lock ? mark(R.wake_lock === "ok" ? true : "warn", R.wake_lock) : mark(null)],
+    ["Свайп не закрывает", e.tg ? mark(e.tg_disable_swipes === true ? true : "warn", String(e.tg_disable_swipes)) : mark(null)],
+  ];
+  $("checks").innerHTML = rows.map(([k, v]) => `<li><span>${k}</span>${v}</li>`).join("");
+  $("report").textContent = JSON.stringify(R, null, 1);
+}
+
+// ---------- buttons ----------
+$("btnStart").onclick = async () => {
+  if (!R.env.has_getUserMedia) { R.camera.access = "error"; R.camera.error = "getUserMedia недоступен"; render(); return; }
+  await startCamera();
+  render();
+};
+$("btnTorch").onclick = toggleTorch;
+$("btnStop").onclick = () => { stopCamera(); render(); };
+$("selCam").onchange = async (ev) => { await startCamera(ev.target.value); render(); };
+$("btnTorchYes").onclick = () => { R.torch.visual = true; $("torchConfirm").hidden = true; render(); };
+$("btnTorchNo").onclick = () => { R.torch.visual = false; $("torchConfirm").hidden = true; render(); };
+$("btnCopy").onclick = async () => {
+  const text = JSON.stringify(R, null, 1);
+  try { await navigator.clipboard.writeText(text); $("btnCopy").textContent = "Скопировано"; }
+  catch (e) { $("btnCopy").textContent = "Не вышло, нужен скриншот"; }
+};
+
+initEnv();
+render();
+setInterval(analyse, 250);
+setInterval(() => { estimateHr(); render(); }, 1000);
+</script>
+</body>
+</html>
